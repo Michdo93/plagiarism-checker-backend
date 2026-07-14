@@ -1,5 +1,6 @@
 import os
 import time
+import io
 import requests
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -8,10 +9,11 @@ from duckduckgo_search import DDGS
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 import nltk
+from pypdf import PdfReader
 
 app = FastAPI(title="Plagiatsprüfung-API")
 
-# CORS konfigurieren, damit dein Frontend (auch von localhost oder anderen Domains) darauf zugreifen darf
+# CORS konfigurieren, damit dein Frontend darauf zugreifen darf
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -37,7 +39,6 @@ class PlagiarismChecker:
     def search_web(self, sentence, max_results=2):
         urls = []
         try:
-            # Exakte Satzsuche
             query = f'"{sentence}"'
             results = self.ddg.text(query, max_results=max_results)
             if results:
@@ -92,25 +93,44 @@ def read_root():
 
 @app.post("/scan")
 async def scan_document(file: UploadFile = File(...)):
-    # Unterstützt momentan einfache .txt-Dateien (für PDFs/Word müsste man extra Parser einbinden)
-    if not file.filename.endswith('.txt'):
-        raise HTTPException(status_code=400, detail="Es werden derzeit nur .txt-Dateien unterstützt.")
-    
+    filename = file.filename.lower()
+    original_text = ""
+
     try:
         content_bytes = await file.read()
-        original_text = content_bytes.decode('utf-8')
-    except Exception:
-        raise HTTPException(status_code=400, detail="Datei konnte nicht als UTF-8 gelesen werden.")
+        
+        # 1. PDF-Verarbeitung
+        if filename.endswith('.pdf'):
+            pdf_stream = io.BytesIO(content_bytes)
+            reader = PdfReader(pdf_stream)
+            extracted_pages = []
+            for page in reader.pages:
+                text = page.extract_text()
+                if text:
+                    extracted_pages.append(text)
+            original_text = "\n".join(extracted_pages)
+            
+        # 2. TXT-Verarbeitung (Fallback)
+        elif filename.endswith('.txt'):
+            original_text = content_bytes.decode('utf-8')
+        else:
+            raise HTTPException(status_code=400, detail="Es werden nur .pdf und .txt Dateien unterstützt.")
+            
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Datei konnte nicht gelesen werden: {str(e)}")
+
+    if not original_text.strip():
+        raise HTTPException(status_code=400, detail="Die Datei scheint keinen lesbaren Text zu enthalten (evtl. ein eingescanntes Bild-PDF?).")
 
     checker = PlagiarismChecker()
     sentences = checker.split_into_sentences(original_text)
     
     if not sentences:
-        return {"matches": [], "message": "Der hochgeladene Text ist zu kurz oder enthält keine brauchbaren Sätze."}
+        return {"matches": [], "message": "Der extrahierte Text ist zu kurz für einen Scan."}
 
     potential_sources = {}
     
-    # Durchsuche die ersten Sätze (begrenzt, um Timeouts auf Render.com zu vermeiden)
+    # Aus Performancegründen (und um Timeouts auf Renders Free-Tier zu vermeiden) prüfen wir max. 15 prägnante Sätze
     for idx, sentence in enumerate(sentences[:15]): 
         # Web
         web_urls = checker.search_web(sentence)
@@ -124,7 +144,7 @@ async def scan_document(file: UploadFile = File(...)):
             if url not in potential_sources:
                 potential_sources[url] = ("scholar", snippet)
         
-        time.sleep(0.5) # Höfliches Delay
+        time.sleep(0.5)
 
     results = []
     for url, source_type in potential_sources.items():
@@ -142,6 +162,5 @@ async def scan_document(file: UploadFile = File(...)):
             if similarity > 3.0:
                 results.append({"source": source_name, "score": similarity})
 
-    # Sortieren nach Ähnlichkeit
     results = sorted(results, key=lambda x: x["score"], reverse=True)
     return {"matches": results}
