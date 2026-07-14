@@ -30,7 +30,7 @@ except LookupError:
 class PlagiarismChecker:
     def __init__(self):
         # max_clients verringern, um Rate-Limits auf Servern vorzubeugen
-        self.ddg = DDGS(max_clients=5)
+        self.ddg = DDGS()
 
     def is_valid_sentence(self, sentence):
         """Filtert unbrauchbare Fragmente aus (Zahlen, kurze Verzeichniseinträge)."""
